@@ -1,6 +1,6 @@
 # Migration / debug report: Factorio 2.0 port
 
-**Mod:** `ick-automatic-train-repair`  
+**Mod:** `kris-ick-automatic-train-repair`  
 **From:** `1.1.4` (`factorio_version` 1.1)  
 **To:** `2.0.0` (`factorio_version` 2.0, `dependencies`: `base >= 2.0.0`)  
 **Target runtime:** Factorio **2.0.77** (and other 2.0 builds compatible with the declared dependency)  
@@ -316,8 +316,8 @@ Useful things to search:
 
 | Search / look for | Meaning |
 |-------------------|---------|
-| `ick-automatic-train-repair` | Mod load / script errors from this mod. |
-| `Error while running event ick-automatic-train-repair` | Exact handler (`on_entity_died`, `on_built_entity`, `on_object_destroyed`, etc.) and Lua stack. |
+| `kris-ick-automatic-train-repair` | Mod load / script errors from this mod. |
+| `Error while running event kris-ick-automatic-train-repair` | Exact handler (`on_entity_died`, `on_built_entity`, `on_object_destroyed`, etc.) and Lua stack. |
 | `insert_plan` / `BlueprintInsertPlan` | Bad plan shape if Factorio rejects assignment. |
 | `register_on_object_destroyed` | Registration API misuse. |
 | `attempt to index field 'train' (a nil value)` | Missing `train and` guard (should be fixed in 2.0.0). |
