@@ -1,4 +1,60 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.0.6
+Date: 2026-07-22
+  Bugfixes:
+    - Fixed crash on load: use game.train_manager.get_trains (LuaForce.get_trains was removed in Factorio 2.0).
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.5
+Date: 2026-07-22
+  Features:
+    - Always keep a live registry of every train's schedule/group/layout in storage; on destroy, look that record up and restore it after rebuild.
+  Changes:
+    - Fuel amount 0 now requests a full fuel inventory (slot count × stack size), not a single stack.
+  Bugfixes:
+    - Do not discard repair-job schedules when pending clears before the consist matches.
+    - Match rebuilt cars by proximity instead of exact float positions.
+    - Freeze old train registry entries on split instead of deleting them mid-wipe.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.4
+Date: 2026-07-22
+  Bugfixes:
+    - Save schedule/group into mod storage on first death (before Factorio destroys LuaTrain) and re-apply after full rebuild via on_train_created.
+    - Keep partial rebuilds forced to manual/stopped so a single replaced car cannot drive away.
+    - Start repair jobs even when Factorio already flipped the train to manual on the killing blow, as long as a schedule or group existed.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.3
+Date: 2026-07-22
+  Bugfixes:
+    - Preserve schedule/group when a train is fully destroyed: later manual fragments still join the repair job, schedule is always snapshotted, and restore is deferred one tick after rebuild.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.2
+Date: 2026-07-22
+  Changes:
+    - Fuel request amount defaults to 0 = one full stack of each fuel type (still configurable with any positive count).
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.1
+Date: 2026-07-22
+  Features:
+    - Multi-car repair jobs: automatic mode restores when all pending ghosts for an incident are built, in any order.
+    - Saves and restores train group (or station schedule) when a repair job completes.
+  Changes:
+    - Map setting "Automatically enable automatic mode" now defaults to true.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.0
+Date: 2026-07-22
+  Changes:
+    - Ported to Factorio 2.0.
+    - Replaced deprecated runtime APIs (storage, event.entity, prototypes.item, on_object_destroyed, insert_plan).
+    - Item/equipment requests now preserve quality and use ghost insert_plan instead of writable item_requests.
+    - Reuses an existing rolling-stock death ghost when present to avoid duplicate ghosts.
+
+---------------------------------------------------------------------------------------------------
 Version: 1.1.4
 Date: 2021-12-07
   Bugfixes:

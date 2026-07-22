@@ -12,7 +12,7 @@ data:extend(
     type = "bool-setting",
     name = "ick-automatic-mode",
 	order = "b[automatic-mode]",
-    default_value = false
+    default_value = true
   },
   {
     setting_type = "runtime-global",
@@ -42,7 +42,7 @@ data:extend(
     type = "int-setting",
     name = "ick-fuel-amount",
 	order = "f[fuel-amount]",
-	minimum_value = 1,
-    default_value = 1
+	minimum_value = 0,
+    default_value = 0
   }
 })
