@@ -1,7 +1,7 @@
 # Automatic train repair
 
 **Mod name:** `kris-ick-automatic-train-repair`  
-**Version:** 2.0.17  
+**Version:** 2.0.18  
 **Factorio:** 2.0+ (Space Age compatible)  
 **License:** MIT  
 
@@ -9,7 +9,7 @@ Fork of [ickputzdirwech/ick-automatic-train-repair](https://github.com/ickputzdi
 
 When rolling stock is destroyed, the consist is stopped, ghosts are created for reconstruction, and **schedule/group** are restored once the train is whole again. **Automatic mode** is restored when the job finishes — optionally after the train is refueled. Players and bots can both finish the repair.
 
-**Portal / install name must match** `info.json` → folder / zip: `kris-ick-automatic-train-repair_2.0.17/`.
+**Portal / install name must match** `info.json` → folder / zip: `kris-ick-automatic-train-repair_2.0.18/`.
 
 ---
 
@@ -103,7 +103,7 @@ Setting IDs keep the `ick-*` prefix for save compatibility with the original mod
 ## Package layout
 
 ```
-kris-ick-automatic-train-repair_2.0.17/
+kris-ick-automatic-train-repair_2.0.18/
   info.json          # name must be kris-ick-automatic-train-repair
   control.lua
   data.lua           # icons use __kris-ick-automatic-train-repair__/...

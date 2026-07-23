@@ -1,6 +1,6 @@
 # Migration / debug report: Factorio 2.0 port
 
-> **Historical document** for the 1.1.4 → 2.0.0 port. Current shipping version is **2.0.17** (`kris-ick-automatic-train-repair`). Prefer `README.md`, `changelog.txt`, and `info.json` for present-day behavior.
+> **Historical document** for the 1.1.4 → 2.0.0 port. Current shipping version is **2.0.18** (`kris-ick-automatic-train-repair`). Prefer `README.md`, `changelog.txt`, and `info.json` for present-day behavior.
 
 **Mod (at port time):** `ick-automatic-train-repair`  
 **From:** `1.1.4` (`factorio_version` 1.1)  
