@@ -4,6 +4,8 @@ Date: 2026-07-22
   Bugfixes:
     - Restore schedule/group as soon as the consist matches expected layout; only automatic mode waits for the refuel threshold (empty train GUI while awaiting fuel looked like a lost schedule).
     - Prefer joining a nearby open repair job and never shrink expected carriage counts, so mid-rebuild kills no longer spawn a second undersized job that never completes correctly.
+  Changes:
+    - Removed temporary [ick-atr] schedule-debug logging (console, factorio-current.log, and script-output file).
 
 ---------------------------------------------------------------------------------------------------
 Version: 2.0.16
