@@ -1,7 +1,7 @@
 # Automatic train repair
 
 **Mod name:** `kris-ick-automatic-train-repair`  
-**Version:** 2.0.18  
+**Version:** 2.1.0  
 **Factorio:** 2.0+ (Space Age compatible)  
 **License:** MIT  
 
@@ -9,7 +9,7 @@ Fork of [ickputzdirwech/ick-automatic-train-repair](https://github.com/ickputzdi
 
 When rolling stock is destroyed, the consist is stopped, ghosts are created for reconstruction, and **schedule/group** are restored once the train is whole again. **Automatic mode** is restored when the job finishes — optionally after the train is refueled. Players and bots can both finish the repair.
 
-**Portal / install name must match** `info.json` → folder / zip: `kris-ick-automatic-train-repair_2.0.18/`.
+**Portal / install name must match** `info.json` → folder / zip: `kris-ick-automatic-train-repair_2.1.0/`.
 
 ---
 
@@ -40,6 +40,7 @@ When rolling stock is destroyed, the consist is stopped, ghosts are created for 
 ### Schedule / group identity
 - Live registry of trains (`schedule`, group, layout, centroid).
 - Empty mid-repair snapshots do **not** erase a richer stored schedule/group.
+- **Player schedule edits** are stamped and preferred over older cached/frozen timetables on rebuild.
 - Lookup **hard-prefers history entries that still have a schedule** and disregards blank live/rebuild snapshots when a scheduled record exists nearby (same force/surface).
 - Open jobs + a nearby **identity cache** (~10 minutes) cover rebuilds and **repeated destroys** (new unit numbers).
 - Empty `on_train_schedule_changed` during an active nearby repair no longer wipes inherited timetables (splits/rebuilds were doing that).
@@ -103,7 +104,7 @@ Setting IDs keep the `ick-*` prefix for save compatibility with the original mod
 ## Package layout
 
 ```
-kris-ick-automatic-train-repair_2.0.18/
+kris-ick-automatic-train-repair_2.1.0/
   info.json          # name must be kris-ick-automatic-train-repair
   control.lua
   data.lua           # icons use __kris-ick-automatic-train-repair__/...

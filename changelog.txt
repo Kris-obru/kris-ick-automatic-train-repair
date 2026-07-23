@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.1.0
+Date: 2026-07-22
+  Bugfixes:
+    - Player schedule edits are stamped and preferred over older cached/frozen timetables, so a rebuilt train restores the schedule you last set — not a previous one.
+
+---------------------------------------------------------------------------------------------------
 Version: 2.0.18
 Date: 2026-07-22
   Changes:

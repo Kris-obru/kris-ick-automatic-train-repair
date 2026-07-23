@@ -327,6 +327,7 @@ local function identity_score(schedule, group, was_automatic)
 end
 
 -- Hard preference: any timetable beats none. Then richer schedule / group / size.
+-- schedule_tick (set on player edits) beats richer-but-stale history.
 local function record_preference_score(record, bonus)
 	if not record then
 		return -1
@@ -348,6 +349,10 @@ local function record_preference_score(record, bonus)
 	if record.frozen then
 		score = score + 10
 	end
+	-- Player schedule edits stamp schedule_tick; that must outrank older richer snapshots.
+	if record.schedule_tick then
+		score = score + record.schedule_tick
+	end
 	return score
 end
 
@@ -365,7 +370,24 @@ local function record_identity_score(record)
 	return identity_score(record.schedule, record.group, record.was_automatic)
 end
 
+-- True when source's timetable should replace target's (recency first, then richness).
+local function source_schedule_preferred(source, target)
+	if not record_has_schedule(source) then
+		return false
+	end
+	if not record_has_schedule(target) then
+		return true
+	end
+	local st = source.schedule_tick or 0
+	local tt = target.schedule_tick or 0
+	if st ~= tt then
+		return st > tt
+	end
+	return schedule_score(source.schedule) > schedule_score(target.schedule)
+end
+
 -- Merge identity fields: never let an empty snapshot erase a richer schedule/group.
+-- When both have schedules, prefer the newer schedule_tick (player edits win over history).
 local function merge_expected_counts(a, b)
 	local out = {}
 	if a then
@@ -385,11 +407,12 @@ local function merge_identity_into(target, source)
 	if not target or not source then
 		return target
 	end
-	-- Always take a real schedule over none / weaker.
-	if record_has_schedule(source) and schedule_score(source.schedule) > schedule_score(target.schedule) then
+	if source_schedule_preferred(source, target) then
 		target.schedule = deep_copy(source.schedule)
+		target.schedule_tick = source.schedule_tick or target.schedule_tick
 	elseif not target.schedule and source.schedule then
 		target.schedule = deep_copy(source.schedule)
+		target.schedule_tick = source.schedule_tick or target.schedule_tick
 	end
 	if (not target.group or target.group == "") and source.group and source.group ~= "" then
 		target.group = source.group
@@ -449,6 +472,7 @@ local function remember_identity(source)
 		surface_index = source.surface_index,
 		centroid = deep_copy(source.centroid),
 		schedule = deep_copy(source.schedule),
+		schedule_tick = source.schedule_tick or game.tick,
 		group = source.group,
 		was_automatic = source.was_automatic,
 		expected = deep_copy(source.expected),
@@ -463,8 +487,10 @@ local function remember_identity(source)
 			local dx = old.centroid.x - entry.centroid.x
 			local dy = old.centroid.y - entry.centroid.y
 			if dx * dx + dy * dy <= 400 then
-				-- Never replace a scheduled cache entry with a weaker/blank one.
-				if record_preference_score(entry) >= record_preference_score(old) then
+				-- Newer player edits replace older cache even if the new timetable is shorter.
+				if source_schedule_preferred(entry, old)
+					or record_preference_score(entry) >= record_preference_score(old)
+				then
 					cache[i] = entry
 				end
 				return
@@ -474,6 +500,71 @@ local function remember_identity(source)
 	table.insert(cache, entry)
 	while #cache > 40 do
 		table.remove(cache, 1)
+	end
+end
+
+-- After a player edits a schedule, overwrite nearby registry/job copies so rebuild
+-- does not resurrect the pre-edit timetable from frozen train ids / open jobs.
+local function supersede_nearby_schedules(record)
+	if not record or not record_has_schedule(record) then
+		return
+	end
+	local stamp = record.schedule_tick or game.tick
+	record.schedule_tick = stamp
+
+	local function shares_units(other)
+		if not record.carriages or not other.carriages then
+			return false
+		end
+		for _, a in pairs(record.carriages) do
+			for _, b in pairs(other.carriages) do
+				if a.unit_number and a.unit_number == b.unit_number then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function nearby(other)
+		if not record.centroid or not other.centroid then
+			return false
+		end
+		if record.force_name and other.force_name and record.force_name ~= other.force_name then
+			return false
+		end
+		if record.surface_index and other.surface_index and record.surface_index ~= other.surface_index then
+			return false
+		end
+		local dx = record.centroid.x - other.centroid.x
+		local dy = record.centroid.y - other.centroid.y
+		return (dx * dx + dy * dy) <= 400
+	end
+
+	if storage.ick_trains then
+		for _, other in pairs(storage.ick_trains) do
+			if other ~= record and (shares_units(other) or nearby(other)) then
+				if (other.schedule_tick or 0) < stamp then
+					other.schedule = deep_copy(record.schedule)
+					other.schedule_tick = stamp
+					if record.group then
+						other.group = record.group
+					end
+				end
+			end
+		end
+	end
+
+	if storage.ick_repair_jobs then
+		for _, job in pairs(storage.ick_repair_jobs) do
+			if nearby(job) and (job.schedule_tick or 0) < stamp then
+				job.schedule = deep_copy(record.schedule)
+				job.schedule_tick = stamp
+				if record.group then
+					job.group = record.group
+				end
+			end
+		end
 	end
 end
 
@@ -690,11 +781,17 @@ local function register_train(train, opts)
 	local schedule = snapshot_train_schedule(train)
 	local was_automatic = train.manual_mode == false
 	local first = train.carriages[1]
+	local schedule_tick = previous and previous.schedule_tick or nil
+
 	-- Mid-repair / fragment trains often have no schedule yet. Keep richer identity
 	-- unless this is an explicit schedule change (force_identity).
-	if previous and not opts.force_identity then
+	if opts.force_identity then
+		-- Live timetable is authoritative (player edit or intentional apply).
+		schedule_tick = game.tick
+	elseif previous then
 		if schedule_score(schedule) < schedule_score(previous.schedule) then
 			schedule = deep_copy(previous.schedule)
+			schedule_tick = previous.schedule_tick
 		end
 		if (not group or group == "") and previous.group and previous.group ~= "" then
 			group = previous.group
@@ -709,6 +806,7 @@ local function register_train(train, opts)
 		local hist = find_scheduled_history_record(first)
 		if hist and hist.schedule then
 			schedule = deep_copy(hist.schedule)
+			schedule_tick = hist.schedule_tick or schedule_tick
 			if (not group or group == "") and hist.group then
 				group = hist.group
 			end
@@ -721,6 +819,7 @@ local function register_train(train, opts)
 	storage.ick_trains[train_id] = {
 		train_id = train_id,
 		schedule = schedule,
+		schedule_tick = schedule_tick,
 		group = group,
 		was_automatic = was_automatic,
 		manual_mode = train.manual_mode,
@@ -754,8 +853,27 @@ local function register_train(train, opts)
 					end
 				end
 			end
+			-- Also clear stale schedules on nearby frozen records / open jobs.
+			if storage.ick_trains then
+				for _, other in pairs(storage.ick_trains) do
+					if other ~= record and other.centroid and record.centroid
+						and other.force_name == record.force_name
+						and other.surface_index == record.surface_index
+					then
+						local dx = other.centroid.x - record.centroid.x
+						local dy = other.centroid.y - record.centroid.y
+						if dx * dx + dy * dy <= 400 and (other.schedule_tick or 0) < (record.schedule_tick or 0) then
+							other.schedule = nil
+							other.schedule_tick = record.schedule_tick
+						end
+					end
+				end
+			end
 		elseif opts.remember and record_identity_score(record) > 0 then
+			supersede_nearby_schedules(record)
 			remember_identity(record)
+		elseif record_has_schedule(record) then
+			supersede_nearby_schedules(record)
 		end
 	elseif opts.remember and record_identity_score(record) > 0 then
 		remember_identity(record)
@@ -985,6 +1103,7 @@ local function create_repair_job_from_record(record, entity)
 		was_automatic = seed.was_automatic,
 		group = seed.group,
 		schedule = deep_copy(seed.schedule),
+		schedule_tick = seed.schedule_tick,
 		carriages = deep_copy(seed.carriages),
 		force_index = seed.force_index or entity.force.index,
 		force_name = seed.force_name or entity.force.name,
@@ -1003,6 +1122,7 @@ local function arm_schedule_restore(job)
 		expected = deep_copy(job.expected),
 		group = job.group,
 		schedule = deep_copy(job.schedule),
+		schedule_tick = job.schedule_tick,
 		was_automatic = job.was_automatic,
 		force_index = job.force_index,
 		force_name = job.force_name,
@@ -1202,6 +1322,7 @@ local function try_complete_repair_job(job_id, entity)
 				surface_index = job.surface_index or live.surface_index,
 				centroid = live.centroid or job.centroid,
 				schedule = job.schedule or live.schedule,
+				schedule_tick = job.schedule_tick or live.schedule_tick or game.tick,
 				group = job.group or live.group,
 				was_automatic = job.was_automatic or live.was_automatic,
 				expected = job.expected or live.expected,
