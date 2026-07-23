@@ -23,6 +23,75 @@ local function deep_copy(value)
 	return copy
 end
 
+---------------------------------------------------------------------------
+-- Schedule debug (console + factorio-current.log). Set false when done diagnosing.
+---------------------------------------------------------------------------
+local ICK_DEBUG = true
+
+local function ick_dbg_schedule_summary(schedule)
+	if not schedule then
+		return "schedule=nil"
+	end
+	local n = schedule.records and #schedule.records or 0
+	local ni = schedule.interrupts and #schedule.interrupts or 0
+	local stations = {}
+	if schedule.records then
+		for i, record in ipairs(schedule.records) do
+			if i > 4 then
+				table.insert(stations, "...")
+				break
+			end
+			table.insert(stations, tostring(record.station or "?"))
+		end
+	end
+	return string.format(
+		"schedule{stops=%d interrupts=%d current=%s stations=[%s]}",
+		n,
+		ni,
+		tostring(schedule.current),
+		table.concat(stations, ", ")
+	)
+end
+
+local function ick_dbg_identity_summary(label, record)
+	if not record then
+		return label .. "=nil"
+	end
+	return string.format(
+		"%s{train_id=%s group=%s auto=%s frozen=%s cars=%s %s}",
+		label,
+		tostring(record.train_id or record.source_train_id),
+		tostring(record.group),
+		tostring(record.was_automatic),
+		tostring(record.frozen),
+		record.carriages and tostring(#record.carriages) or "?",
+		ick_dbg_schedule_summary(record.schedule)
+	)
+end
+
+local function ick_dbg(msg)
+	if not ICK_DEBUG then
+		return
+	end
+	local line = "[ick-atr] t=" .. tostring(game and game.tick or "?") .. " " .. msg
+	log(line)
+	if game then
+		pcall(function()
+			game.print(line)
+		end)
+		-- Dedicated file for sharing. Factorio 2.0: helpers.write_file (not game.write_file).
+		-- Path: %AppData%\Factorio\script-output\ick-atr-debug.log
+		pcall(function()
+			if not storage.ick_debug_log_started then
+				storage.ick_debug_log_started = true
+				helpers.write_file("ick-atr-debug.log", "=== ick-atr schedule debug session start ===\n" .. line .. "\n", false)
+			else
+				helpers.write_file("ick-atr-debug.log", line .. "\n", true)
+			end
+		end)
+	end
+end
+
 local function ensure_storage()
 	storage.ick_destroyed_train = storage.ick_destroyed_train or {}
 	storage.ick_repair_jobs = storage.ick_repair_jobs or {}
@@ -31,6 +100,8 @@ local function ensure_storage()
 	-- Live registry: every known train's identity, always kept up to date.
 	storage.ick_trains = storage.ick_trains or {}
 	storage.ick_unit_to_train = storage.ick_unit_to_train or {}
+	-- Longer-lived identity for rebuild/re-kill cycles (new unit numbers lose registry links).
+	storage.ick_identity_cache = storage.ick_identity_cache or {}
 end
 
 local function add_request(request_map, name, quality, fuel_count, grid_count)
@@ -163,11 +234,11 @@ local function positions_close(a, b)
 	return (dx * dx + dy * dy) <= 0.25
 end
 
--- 0 = fill the entire fuel inventory (slot_count * stack_size). Positive = fixed override.
+-- Fuel request count from a 0–100% of inventory capacity setting.
 local function fuel_request_amount(item_name, fuel_inv)
-	local configured = settings.global["ick-fuel-amount"].value
-	if configured > 0 then
-		return configured
+	local percent = settings.global["ick-fuel-amount"].value or 100
+	if percent <= 0 then
+		return 0
 	end
 	local stack_size = 50
 	local item_proto = prototypes.item[item_name]
@@ -178,7 +249,8 @@ local function fuel_request_amount(item_name, fuel_inv)
 	if fuel_inv then
 		slots = math.max(1, #fuel_inv)
 	end
-	return slots * stack_size
+	local capacity = slots * stack_size
+	return math.max(1, math.ceil(capacity * percent / 100))
 end
 
 local function serialize_schedule_record(record)
@@ -198,19 +270,28 @@ local function serialize_schedule_record(record)
 	}
 end
 
-local function snapshot_train_schedule(train)
+local function snapshot_train_schedule(train, quiet)
 	if not train then
+		if not quiet then ick_dbg("snapshot: train=nil") end
 		return nil
+	end
+	local function sdbg(msg)
+		if not quiet then ick_dbg(msg) end
 	end
 	local ok, lua_schedule = pcall(function()
 		return train.get_schedule()
 	end)
 	if ok and lua_schedule then
 		local records = {}
+		local raw_n = 0
+		local dropped_rail = 0
 		for _, record in pairs(lua_schedule.get_records() or {}) do
+			raw_n = raw_n + 1
 			local serialized = serialize_schedule_record(record)
 			if serialized then
 				table.insert(records, serialized)
+			else
+				dropped_rail = dropped_rail + 1
 			end
 		end
 		local interrupts = {}
@@ -229,39 +310,86 @@ local function snapshot_train_schedule(train)
 			})
 		end
 		if records[1] or interrupts[1] then
-			return {
+			local snap = {
 				current = lua_schedule.current,
 				records = records,
 				interrupts = interrupts,
 			}
+			sdbg(string.format(
+				"snapshot train=%s via get_schedule raw_stops=%d kept=%d dropped_non_station=%d group=%s %s",
+				tostring(train.id),
+				raw_n,
+				#records,
+				dropped_rail,
+				tostring(train.group ~= "" and train.group or nil),
+				ick_dbg_schedule_summary(snap)
+			))
+			return snap
 		end
+		sdbg(string.format(
+			"snapshot train=%s get_schedule empty after serialize raw_stops=%d dropped_non_station=%d group=%s",
+			tostring(train.id),
+			raw_n,
+			dropped_rail,
+			tostring(train.group ~= "" and train.group or nil)
+		))
 	end
 
 	local schedule = train.schedule
 	if not schedule or not schedule.records then
+		sdbg(string.format(
+			"snapshot train=%s NO schedule (train.schedule nil/empty) group=%s manual=%s",
+			tostring(train.id),
+			tostring(train.group ~= "" and train.group or nil),
+			tostring(train.manual_mode)
+		))
 		return nil
 	end
 	local records = {}
+	local dropped_rail = 0
 	for _, record in pairs(schedule.records) do
 		local serialized = serialize_schedule_record(record)
 		if serialized then
 			table.insert(records, serialized)
+		else
+			dropped_rail = dropped_rail + 1
 		end
 	end
 	if not records[1] then
+		sdbg(string.format(
+			"snapshot train=%s legacy schedule had stops but ALL dropped (non-station?) dropped=%d group=%s",
+			tostring(train.id),
+			dropped_rail,
+			tostring(train.group ~= "" and train.group or nil)
+		))
 		return nil
 	end
-	return {
+	local snap = {
 		current = schedule.current,
 		records = records,
 		interrupts = {},
 	}
+	sdbg(string.format(
+		"snapshot train=%s via train.schedule kept=%d dropped=%d %s",
+		tostring(train.id),
+		#records,
+		dropped_rail,
+		ick_dbg_schedule_summary(snap)
+	))
+	return snap
 end
 
 local function apply_train_identity(train, group, schedule_snapshot)
 	if not train then
+		ick_dbg("apply_identity: train=nil")
 		return false
 	end
+	ick_dbg(string.format(
+		"apply_identity BEFORE train=%s group_arg=%s %s",
+		tostring(train.id),
+		tostring(group),
+		ick_dbg_schedule_summary(schedule_snapshot)
+	))
 	train.manual_mode = true
 	train.speed = 0
 
@@ -270,25 +398,400 @@ local function apply_train_identity(train, group, schedule_snapshot)
 			current = schedule_snapshot.current or 1,
 			records = deep_copy(schedule_snapshot.records),
 		}
+		ick_dbg("apply_identity: wrote train.schedule records")
+	else
+		ick_dbg("apply_identity: SKIPPED writing schedule (nil or empty records) — THIS LOSES TIMETABLE")
 	end
 
 	if group and group ~= "" then
 		train.group = group
+		ick_dbg("apply_identity: wrote train.group=" .. tostring(group))
 	elseif schedule_snapshot and schedule_snapshot.interrupts and schedule_snapshot.interrupts[1] then
 		local ok, lua_schedule = pcall(function()
 			return train.get_schedule()
 		end)
 		if ok and lua_schedule then
-			pcall(function()
+			local iok, ierr = pcall(function()
 				lua_schedule.set_interrupts(deep_copy(schedule_snapshot.interrupts))
 			end)
+			ick_dbg("apply_identity: set_interrupts ok=" .. tostring(iok) .. " err=" .. tostring(ierr))
 		end
 	end
+
+	local after = snapshot_train_schedule(train)
+	ick_dbg(string.format(
+		"apply_identity AFTER train=%s live_group=%s %s",
+		tostring(train.id),
+		tostring(train.group ~= "" and train.group or nil),
+		ick_dbg_schedule_summary(after)
+	))
 	return true
+end
+
+---------------------------------------------------------------------------
+-- Identity richness / cache (survive rebuild + repeated destroys)
+---------------------------------------------------------------------------
+
+local function schedule_score(schedule)
+	if not schedule then
+		return 0
+	end
+	local score = 0
+	if schedule.records then
+		score = score + #schedule.records * 10
+	end
+	if schedule.interrupts then
+		score = score + #schedule.interrupts * 5
+	end
+	return score
+end
+
+local function record_has_schedule(record)
+	return schedule_score(record and record.schedule) > 0
+end
+
+local function identity_score(schedule, group, was_automatic)
+	local score = schedule_score(schedule)
+	if group and group ~= "" then
+		score = score + 100
+	end
+	if was_automatic then
+		score = score + 1
+	end
+	return score
+end
+
+-- Hard preference: any timetable beats none. Then richer schedule / group / size.
+local function record_preference_score(record, bonus)
+	if not record then
+		return -1
+	end
+	local score = (bonus or 0) + identity_score(record.schedule, record.group, record.was_automatic)
+	if record_has_schedule(record) then
+		score = score + 100000
+	end
+	-- Strongly prefer fuller consists so a 1–2 car fragment never beats the original 4-car snapshot.
+	local car_n = 0
+	if record.carriages then
+		car_n = #record.carriages
+	elseif record.expected then
+		for _, c in pairs(record.expected) do
+			car_n = car_n + c
+		end
+	end
+	score = score + car_n * 100
+	if record.frozen then
+		score = score + 10
+	end
+	return score
+end
+
+local function pick_richer_schedule(a, b)
+	if schedule_score(a) >= schedule_score(b) then
+		return a
+	end
+	return b
+end
+
+local function record_identity_score(record)
+	if not record then
+		return 0
+	end
+	return identity_score(record.schedule, record.group, record.was_automatic)
+end
+
+-- Merge identity fields: never let an empty snapshot erase a richer schedule/group.
+local function merge_expected_counts(a, b)
+	local out = {}
+	if a then
+		for k, v in pairs(a) do
+			out[k] = v
+		end
+	end
+	if b then
+		for k, v in pairs(b) do
+			out[k] = math.max(out[k] or 0, v)
+		end
+	end
+	return out
+end
+
+local function merge_identity_into(target, source)
+	if not target or not source then
+		ick_dbg("merge: skipped target_or_source_nil")
+		return target
+	end
+	local before = schedule_score(target.schedule)
+	-- Always take a real schedule over none / weaker.
+	if record_has_schedule(source) and schedule_score(source.schedule) > schedule_score(target.schedule) then
+		target.schedule = deep_copy(source.schedule)
+		ick_dbg("merge: took source schedule (richer) " .. ick_dbg_schedule_summary(target.schedule))
+	elseif not target.schedule and source.schedule then
+		target.schedule = deep_copy(source.schedule)
+		ick_dbg("merge: filled empty target schedule " .. ick_dbg_schedule_summary(target.schedule))
+	else
+		ick_dbg(string.format(
+			"merge: kept target schedule (before_score=%d source_score=%d)",
+			before,
+			schedule_score(source.schedule)
+		))
+	end
+	if (not target.group or target.group == "") and source.group and source.group ~= "" then
+		target.group = source.group
+		ick_dbg("merge: took source group=" .. tostring(source.group))
+	end
+	if source.was_automatic then
+		target.was_automatic = true
+	end
+	local target_n = target.carriages and #target.carriages or 0
+	local source_n = source.carriages and #source.carriages or 0
+	if source_n > target_n then
+		target.carriages = deep_copy(source.carriages)
+		if source.centroid then
+			target.centroid = deep_copy(source.centroid)
+		end
+	end
+	-- Never shrink expected layout (fragment snapshots must not replace a 4-car job with 2 cars).
+	if source.expected or target.expected then
+		target.expected = merge_expected_counts(target.expected, source.expected)
+	end
+	if source.force_name and not target.force_name then
+		target.force_name = source.force_name
+	end
+	if source.surface_index and not target.surface_index then
+		target.surface_index = source.surface_index
+	end
+	if source.train_id and not target.train_id then
+		target.train_id = source.train_id
+	end
+	return target
+end
+
+local function cleanup_identity_cache()
+	local cache = storage.ick_identity_cache
+	if not cache then
+		return
+	end
+	for i = #cache, 1, -1 do
+		local entry = cache[i]
+		if not entry or (entry.expire_tick and game.tick > entry.expire_tick) then
+			table.remove(cache, i)
+		end
+	end
+end
+
+local function remember_identity(source)
+	if not source then
+		ick_dbg("remember: source=nil")
+		return
+	end
+	-- Only cache entries that actually have a schedule (or at least a group).
+	if not record_has_schedule(source) and not (source.group and source.group ~= "") then
+		ick_dbg("remember: SKIPPED (no schedule and no group) " .. ick_dbg_identity_summary("src", source))
+		return
+	end
+	ensure_storage()
+	cleanup_identity_cache()
+	local entry = {
+		force_name = source.force_name,
+		surface_index = source.surface_index,
+		centroid = deep_copy(source.centroid),
+		schedule = deep_copy(source.schedule),
+		group = source.group,
+		was_automatic = source.was_automatic,
+		expected = deep_copy(source.expected),
+		expire_tick = game.tick + 36000,
+	}
+	local cache = storage.ick_identity_cache
+	for i, old in ipairs(cache) do
+		if old.force_name == entry.force_name
+			and old.surface_index == entry.surface_index
+			and old.centroid and entry.centroid
+		then
+			local dx = old.centroid.x - entry.centroid.x
+			local dy = old.centroid.y - entry.centroid.y
+			if dx * dx + dy * dy <= 400 then
+				-- Never replace a scheduled cache entry with a weaker/blank one.
+				if record_preference_score(entry) >= record_preference_score(old) then
+					cache[i] = entry
+					ick_dbg("remember: REPLACED nearby cache " .. ick_dbg_identity_summary("entry", entry))
+				else
+					ick_dbg("remember: KEPT stronger cache old=" .. ick_dbg_schedule_summary(old.schedule)
+						.. " new=" .. ick_dbg_schedule_summary(entry.schedule))
+				end
+				return
+			end
+		end
+	end
+	table.insert(cache, entry)
+	ick_dbg("remember: ADDED cache #" .. tostring(#cache) .. " " .. ick_dbg_identity_summary("entry", entry))
+	while #cache > 40 do
+		table.remove(cache, 1)
+	end
+end
+
+local function find_cached_identity(entity, expected)
+	ensure_storage()
+	cleanup_identity_cache()
+	if not entity or not entity.valid then
+		return nil
+	end
+	local best, best_score = nil, -1
+	local pos = entity.position
+	for _, entry in ipairs(storage.ick_identity_cache) do
+		if entry.force_name == entity.force.name
+			and entry.surface_index == entity.surface.index
+			and entry.centroid
+		then
+			local expected_ok = true
+			if expected and entry.expected then
+				expected_ok = counts_match(entry.expected, expected)
+			end
+			if expected_ok then
+				local dx = entry.centroid.x - pos.x
+				local dy = entry.centroid.y - pos.y
+				local dist2 = dx * dx + dy * dy
+				if dist2 <= 400 then
+					-- Prefer scheduled entries; among those, closer + richer.
+					local score = record_preference_score(entry) - math.floor(dist2)
+					if score > best_score then
+						best = entry
+						best_score = score
+					end
+				end
+			end
+		end
+	end
+	if not best and expected then
+		return find_cached_identity(entity, nil)
+	end
+	-- If the best hit has no schedule, try again requiring a schedule.
+	if best and not record_has_schedule(best) then
+		local scheduled_best, scheduled_score = nil, -1
+		for _, entry in ipairs(storage.ick_identity_cache) do
+			if entry.force_name == entity.force.name
+				and entry.surface_index == entity.surface.index
+				and entry.centroid
+				and record_has_schedule(entry)
+			then
+				local dx = entry.centroid.x - pos.x
+				local dy = entry.centroid.y - pos.y
+				local dist2 = dx * dx + dy * dy
+				if dist2 <= 400 then
+					local score = record_preference_score(entry) - math.floor(dist2)
+					if score > scheduled_score then
+						scheduled_best = entry
+						scheduled_score = score
+					end
+				end
+			end
+		end
+		if scheduled_best then
+			return scheduled_best
+		end
+	end
+	return best
+end
+
+-- Scan registry history for the best scheduled train near this entity (ignore blank snapshots).
+local function find_scheduled_history_record(entity)
+	if not entity or not entity.valid or not storage.ick_trains then
+		return nil, nil
+	end
+	local best, best_id, best_score = nil, nil, -1
+	local pos = entity.position
+	local force_name = entity.force.name
+	local surface_index = entity.surface.index
+	local unit = entity.unit_number
+
+	for id, record in pairs(storage.ick_trains) do
+		if not record_has_schedule(record) then
+			-- User request: disregard history entries without a schedule.
+		elseif record.force_name and record.force_name ~= force_name then
+			-- skip other forces
+		elseif record.surface_index and record.surface_index ~= surface_index then
+			-- skip other surfaces
+		else
+			local related = false
+			local dist_penalty = 0
+			if record.carriages then
+				for _, carriage in pairs(record.carriages) do
+					if carriage.unit_number == unit then
+						related = true
+						break
+					end
+				end
+			end
+			if not related and record.centroid then
+				local dx = record.centroid.x - pos.x
+				local dy = record.centroid.y - pos.y
+				local dist2 = dx * dx + dy * dy
+				if dist2 <= 400 then
+					related = true
+					dist_penalty = math.floor(dist2)
+				end
+			end
+			if related then
+				local score = record_preference_score(record) - dist_penalty
+				if score > best_score then
+					best = record
+					best_id = id
+					best_score = score
+				end
+			end
+		end
+	end
+	ick_dbg(string.format(
+		"find_scheduled_history hit_id=%s score=%s %s",
+		tostring(best_id),
+		tostring(best_score),
+		best and ick_dbg_schedule_summary(best.schedule) or "none"
+	))
+	return best, best_id
 end
 
 local function pending_is_empty(pending)
 	return pending == nil or next(pending) == nil
+end
+
+local function train_near_repair_context(train)
+	if not train or not train.valid then
+		return false
+	end
+	local first = train.carriages[1]
+	if not first then
+		return false
+	end
+	local centroid = train_centroid_from_list(train.carriages)
+	if storage.ick_repair_jobs then
+		for _, job in pairs(storage.ick_repair_jobs) do
+			if job.force_name == first.force.name
+				and job.surface_index == first.surface.index
+				and job.centroid and centroid
+			then
+				local dx = job.centroid.x - centroid.x
+				local dy = job.centroid.y - centroid.y
+				if dx * dx + dy * dy <= 400 then
+					return true
+				end
+			end
+		end
+	end
+	if storage.ick_awaiting_restore then
+		for _, waiting in pairs(storage.ick_awaiting_restore) do
+			if waiting.force_name == first.force.name
+				and waiting.surface_index == first.surface.index
+				and waiting.centroid and centroid
+			then
+				local dx = waiting.centroid.x - centroid.x
+				local dy = waiting.centroid.y - centroid.y
+				if dx * dx + dy * dy <= 400 then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 local function hold_train(train)
@@ -311,19 +814,23 @@ end
 local function freeze_train_id(train_id)
 	local record = storage.ick_trains[train_id]
 	if not record then
+		ick_dbg("freeze: no record for train_id=" .. tostring(train_id))
 		return
 	end
 	-- Keep the snapshot for destroy/repair lookup; stop treating it as a live train.
 	record.frozen = true
 	record.expire_tick = game.tick + 7200
+	ick_dbg("freeze: " .. ick_dbg_identity_summary("frozen", record))
 end
 
-local function register_train(train)
+local function register_train(train, opts)
 	if not train or not train.valid then
 		return nil
 	end
+	opts = opts or {}
 	ensure_storage()
 	local train_id = train.id
+	local previous = storage.ick_trains[train_id]
 	local carriages = {}
 	for _, carriage in pairs(train.carriages) do
 		table.insert(carriages, {
@@ -341,12 +848,62 @@ local function register_train(train)
 	if group == "" then
 		group = nil
 	end
+	local schedule = snapshot_train_schedule(train, opts.quiet)
+	local was_automatic = train.manual_mode == false
 	local first = train.carriages[1]
+	local live_score = schedule_score(schedule)
+
+	if not opts.quiet then
+		ick_dbg(string.format(
+			"register BEGIN train=%s force=%s cars=%d live_score=%d prev_score=%d remember=%s",
+			tostring(train_id),
+			tostring(opts.force_identity),
+			#carriages,
+			live_score,
+			previous and schedule_score(previous.schedule) or -1,
+			tostring(opts.remember)
+		))
+	end
+
+	-- Mid-repair / fragment trains often have no schedule yet. Keep richer identity
+	-- unless this is an explicit schedule change (force_identity).
+	if previous and not opts.force_identity then
+		if schedule_score(schedule) < schedule_score(previous.schedule) then
+			if not opts.quiet then ick_dbg("register: preserving previous schedule over weaker live") end
+			schedule = deep_copy(previous.schedule)
+		end
+		if (not group or group == "") and previous.group and previous.group ~= "" then
+			group = previous.group
+		end
+		if previous.was_automatic then
+			was_automatic = true
+		end
+	elseif previous and opts.force_identity and live_score == 0 and schedule_score(previous.schedule) > 0 then
+		ick_dbg("register: WARNING force_identity with EMPTY live over NON-EMPTY previous — schedule may be wiped")
+	end
+
+	-- If this train id still has no timetable, pull one from scheduled history nearby.
+	if not opts.force_identity and schedule_score(schedule) == 0 and first then
+		local hist = find_scheduled_history_record(first)
+		if hist and hist.schedule then
+			if not opts.quiet then ick_dbg("register: pulled schedule from history train_id=" .. tostring(hist.train_id)) end
+			schedule = deep_copy(hist.schedule)
+			if (not group or group == "") and hist.group then
+				group = hist.group
+			end
+			if hist.was_automatic then
+				was_automatic = true
+			end
+		elseif not opts.quiet then
+			ick_dbg("register: no scheduled history found to fill empty live")
+		end
+	end
+
 	storage.ick_trains[train_id] = {
 		train_id = train_id,
-		schedule = snapshot_train_schedule(train),
+		schedule = schedule,
 		group = group,
-		was_automatic = train.manual_mode == false,
+		was_automatic = was_automatic,
 		manual_mode = train.manual_mode,
 		carriages = carriages,
 		expected = count_carriages(train),
@@ -357,7 +914,95 @@ local function register_train(train)
 		tick = game.tick,
 		frozen = false,
 	}
-	return storage.ick_trains[train_id]
+
+	local record = storage.ick_trains[train_id]
+	if opts.force_identity then
+		-- Player cleared/edited schedule: drop nearby cache so we don't resurrect the old one.
+		if record_identity_score(record) <= 0 and record.centroid and record.force_name and record.surface_index then
+			local cache = storage.ick_identity_cache
+			if cache then
+				local removed = 0
+				for i = #cache, 1, -1 do
+					local old = cache[i]
+					if old.force_name == record.force_name
+						and old.surface_index == record.surface_index
+						and old.centroid
+					then
+						local dx = old.centroid.x - record.centroid.x
+						local dy = old.centroid.y - record.centroid.y
+						if dx * dx + dy * dy <= 400 then
+							table.remove(cache, i)
+							removed = removed + 1
+						end
+					end
+				end
+				if removed > 0 then
+					ick_dbg("register: force_identity CLEARED " .. removed .. " nearby cache entries (empty identity)")
+				end
+			end
+		elseif opts.remember and record_identity_score(record) > 0 then
+			remember_identity(record)
+		end
+	elseif opts.remember and record_identity_score(record) > 0 then
+		remember_identity(record)
+	end
+	if not opts.quiet then
+		ick_dbg("register END " .. ick_dbg_identity_summary("stored", record))
+	end
+	return record
+end
+
+local function inherit_identity_onto_train_record(train, old_id_1, old_id_2)
+	if not train or not train.valid then
+		return
+	end
+	local record = storage.ick_trains[train.id]
+	if not record then
+		record = register_train(train)
+	end
+	if not record then
+		return
+	end
+	ick_dbg(string.format(
+		"inherit BEGIN train=%s old1=%s old2=%s %s",
+		tostring(train.id),
+		tostring(old_id_1),
+		tostring(old_id_2),
+		ick_dbg_identity_summary("before", record)
+	))
+	for _, oid in ipairs({old_id_1, old_id_2}) do
+		if oid and storage.ick_trains[oid] then
+			ick_dbg("inherit from frozen id=" .. tostring(oid) .. " " .. ick_dbg_schedule_summary(storage.ick_trains[oid].schedule))
+			merge_identity_into(record, storage.ick_trains[oid])
+		end
+	end
+	local first = train.carriages[1]
+	if first then
+		local cached = find_cached_identity(first, record.expected)
+		if cached then
+			ick_dbg("inherit from cache " .. ick_dbg_schedule_summary(cached.schedule))
+			merge_identity_into(record, cached)
+		else
+			ick_dbg("inherit: no cache hit")
+		end
+	end
+	if storage.ick_repair_jobs and first then
+		for job_id, job in pairs(storage.ick_repair_jobs) do
+			if job.surface_index == first.surface.index
+				and job.force_name == first.force.name
+				and job.centroid
+				and record.centroid
+			then
+				local dx = job.centroid.x - record.centroid.x
+				local dy = job.centroid.y - record.centroid.y
+				if dx * dx + dy * dy <= 400 then
+					ick_dbg("inherit from job_id=" .. tostring(job_id) .. " " .. ick_dbg_schedule_summary(job.schedule))
+					merge_identity_into(record, job)
+				end
+			end
+		end
+	end
+	ick_dbg("inherit END " .. ick_dbg_identity_summary("after", record))
 end
 
 local function cleanup_expired_train_records()
@@ -376,6 +1021,7 @@ local function cleanup_expired_train_records()
 			storage.ick_trains[train_id] = nil
 		end
 	end
+	cleanup_identity_cache()
 end
 
 local function refresh_all_trains()
@@ -389,42 +1035,75 @@ end
 
 local function lookup_train_record(entity, train)
 	ensure_storage()
-	if entity and entity.unit_number then
-		local train_id = storage.ick_unit_to_train[entity.unit_number]
-		if train_id and storage.ick_trains[train_id] then
-			return storage.ick_trains[train_id], train_id
+	local best, best_id, best_score = nil, nil, -1
+
+	local function consider(record, id, bonus)
+		if not record then
+			return
 		end
-		-- Survivors may have been remapped to a new train id after a split; still find the
-		-- richest record (prefer frozen full consists with a schedule).
-		local best, best_id, best_score = nil, nil, -1
+		local score = record_preference_score(record, bonus)
+		ick_dbg(string.format(
+			"lookup consider id=%s bonus=%s score=%s has_sched=%s %s",
+			tostring(id),
+			tostring(bonus),
+			tostring(score),
+			tostring(record_has_schedule(record)),
+			ick_dbg_schedule_summary(record.schedule)
+		))
+		if score > best_score then
+			best = record
+			best_id = id
+			best_score = score
+		end
+	end
+
+	ick_dbg(string.format(
+		"lookup BEGIN unit=%s name=%s pos=(%.1f,%.1f)",
+		tostring(entity and entity.unit_number),
+		tostring(entity and entity.name),
+		entity and entity.position.x or 0,
+		entity and entity.position.y or 0
+	))
+
+	if entity and entity.unit_number then
+		-- Unit map hit (may be a blank live train after rebuild — still consider, but
+		-- scheduled history below will outrank it).
+		local mapped_id = storage.ick_unit_to_train[entity.unit_number]
+		if mapped_id and storage.ick_trains[mapped_id] then
+			ick_dbg("lookup: unit_map -> train_id=" .. tostring(mapped_id))
+			consider(storage.ick_trains[mapped_id], mapped_id, 50)
+		else
+			ick_dbg("lookup: unit_map MISS for unit=" .. tostring(entity.unit_number))
+		end
+
+		-- Any registry row that still lists this unit.
 		for id, record in pairs(storage.ick_trains) do
 			if record.carriages then
 				for _, carriage in pairs(record.carriages) do
 					if carriage.unit_number == entity.unit_number then
-						local score = #(record.carriages)
-						if record.schedule then
-							score = score + 1000
-						end
-						if record.group then
-							score = score + 100
-						end
-						if record.frozen then
-							score = score + 10
-						end
-						if score > best_score then
-							best = record
-							best_id = id
-							best_score = score
-						end
+						consider(record, id, 80)
 						break
 					end
 				end
 			end
 		end
-		if best then
-			return best, best_id
+
+		-- Prefer historical trains that actually had a schedule (ignore blank snapshots).
+		local hist, hist_id = find_scheduled_history_record(entity)
+		if hist then
+			ick_dbg("lookup: scheduled_history hit id=" .. tostring(hist_id))
+			consider(hist, hist_id, 200)
+		else
+			ick_dbg("lookup: scheduled_history MISS")
 		end
 	end
+
+	if best then
+		ick_dbg("lookup END winner id=" .. tostring(best_id) .. " " .. ick_dbg_identity_summary("best", best))
+		return best, best_id
+	end
+
+	ick_dbg("lookup END no registry match")
 	if train and train.valid then
 		register_train(train)
 		return storage.ick_trains[train.id], train.id
@@ -440,10 +1119,26 @@ local function find_job_for_record(train_id, entity)
 	if not storage.ick_repair_jobs then
 		return nil
 	end
+	local best_id, best_score = nil, -1
+
+	local function consider(job_id, job, bonus)
+		local score = (bonus or 0) + record_preference_score(job)
+		if job.awaiting_refuel then
+			score = score + 50
+		end
+		if not pending_is_empty(job.pending) then
+			score = score + 20
+		end
+		if score > best_score then
+			best_id = job_id
+			best_score = score
+		end
+	end
+
 	if train_id then
 		for job_id, job in pairs(storage.ick_repair_jobs) do
 			if job.source_train_id == train_id then
-				return job_id
+				consider(job_id, job, 500)
 			end
 		end
 	end
@@ -451,27 +1146,56 @@ local function find_job_for_record(train_id, entity)
 		local unit = entity.unit_number
 		for job_id, job in pairs(storage.ick_repair_jobs) do
 			if job.member_unit_numbers[unit] then
-				return job_id
-			end
-			if job.surface_index == entity.surface.index and job.force_name == entity.force.name and job.centroid then
+				consider(job_id, job, 400)
+			elseif job.surface_index == entity.surface.index
+				and job.force_name == entity.force.name
+				and job.centroid
+			then
 				local dx = job.centroid.x - entity.position.x
 				local dy = job.centroid.y - entity.position.y
-				if dx * dx + dy * dy <= 225 then
-					return job_id
+				local dist2 = dx * dx + dy * dy
+				-- Trains are long; mid-rebuild kills must still join the open job.
+				if dist2 <= 1600 then
+					consider(job_id, job, 300)
+				elseif dist2 <= 3600 then
+					consider(job_id, job, 150)
 				end
 			end
 		end
 	end
-	return nil
+	return best_id
 end
 
 local function create_repair_job_from_record(record, entity)
+	-- Prefer joining a nearby open job over spawning a second undersized job.
+	local nearby = find_job_for_record(record and record.train_id, entity)
+	if nearby and storage.ick_repair_jobs[nearby] then
+		local job = storage.ick_repair_jobs[nearby]
+		ick_dbg("create_job: redirected to existing nearby job_id=" .. tostring(nearby))
+		if record then
+			merge_identity_into(job, record)
+		end
+		job.member_unit_numbers[entity.unit_number] = true
+		return nearby
+	end
+
+	-- Enrich from scheduled history so a 1–2 car fragment does not set expected too small.
+	local seed = deep_copy(record) or {}
+	local hist = find_scheduled_history_record(entity)
+	if hist then
+		merge_identity_into(seed, hist)
+	end
+	local cached = find_cached_identity(entity, seed.expected)
+	if cached then
+		merge_identity_into(seed, cached)
+	end
+
 	local job_id = storage.ick_next_job_id
 	storage.ick_next_job_id = job_id + 1
 
 	local members = {}
-	if record.carriages then
-		for _, carriage in pairs(record.carriages) do
+	if seed.carriages then
+		for _, carriage in pairs(seed.carriages) do
 			members[carriage.unit_number] = true
 		end
 	else
@@ -479,21 +1203,30 @@ local function create_repair_job_from_record(record, entity)
 	end
 
 	storage.ick_repair_jobs[job_id] = {
-		source_train_id = record.train_id,
-		expected = deep_copy(record.expected) or {[entity.type] = 1},
+		source_train_id = seed.train_id or (record and record.train_id),
+		expected = deep_copy(seed.expected) or {[entity.type] = 1},
 		pending = {},
 		built = {},
 		member_unit_numbers = members,
-		was_automatic = record.was_automatic,
-		group = record.group,
-		schedule = deep_copy(record.schedule),
-		carriages = deep_copy(record.carriages),
-		force_index = record.force_index or entity.force.index,
-		force_name = record.force_name or entity.force.name,
-		surface_index = record.surface_index or entity.surface.index,
-		centroid = deep_copy(record.centroid) or {x = entity.position.x, y = entity.position.y},
+		was_automatic = seed.was_automatic,
+		group = seed.group,
+		schedule = deep_copy(seed.schedule),
+		carriages = deep_copy(seed.carriages),
+		force_index = seed.force_index or entity.force.index,
+		force_name = seed.force_name or entity.force.name,
+		surface_index = seed.surface_index or entity.surface.index,
+		centroid = deep_copy(seed.centroid) or {x = entity.position.x, y = entity.position.y},
 		created_tick = game.tick,
 	}
+	ick_dbg(string.format(
+		"create_job id=%s from record — HAS_SCHEDULE=%s %s",
+		tostring(job_id),
+		tostring(record_has_schedule(storage.ick_repair_jobs[job_id])),
+		ick_dbg_identity_summary("job", storage.ick_repair_jobs[job_id])
+	))
+	if not record_has_schedule(storage.ick_repair_jobs[job_id]) then
+		ick_dbg("create_job WARNING: job created WITHOUT schedule — repeated destroy will lose timetable")
+	end
 	return job_id
 end
 
@@ -512,6 +1245,7 @@ local function arm_schedule_restore(job)
 		centroid = deep_copy(job.centroid),
 		expire_tick = game.tick + 600,
 	}
+	ick_dbg("arm_awaiting_restore token=" .. tostring(token) .. " " .. ick_dbg_schedule_summary(job.schedule))
 	return token
 end
 
@@ -542,12 +1276,14 @@ local function try_apply_awaiting_restore(train)
 				near = (dx * dx + dy * dy) <= 400
 			end
 			if near then
+				ick_dbg("awaiting_restore APPLY token=" .. tostring(token) .. " " .. ick_dbg_schedule_summary(waiting.schedule))
 				apply_train_identity(train, waiting.group, waiting.schedule)
 				if waiting.was_automatic and settings.global["ick-automatic-mode"].value then
 					train.manual_mode = false
 				else
 					hold_train(train)
 				end
+				register_train(train, {force_identity = true, remember = true})
 				storage.ick_awaiting_restore[token] = nil
 				return true
 			end
@@ -556,28 +1292,217 @@ local function try_apply_awaiting_restore(train)
 	return false
 end
 
+-- Fill ratio of one fuel inventory (0..1), or nil if this carriage has no burner fuel.
+local function carriage_fuel_fill_ratio(carriage)
+	if not carriage or not carriage.valid then
+		return nil
+	end
+	local inv = carriage.get_fuel_inventory()
+	if not inv or #inv == 0 then
+		return nil
+	end
+	local fallback_stack = 50
+	local fuel_type = settings.global["ick-fuel-type"].value
+	if fuel_type ~= "" and prototypes.item[fuel_type] then
+		fallback_stack = prototypes.item[fuel_type].stack_size
+	end
+	local filled = 0
+	local capacity = 0
+	for i = 1, #inv do
+		local stack = inv[i]
+		if stack.valid_for_read then
+			filled = filled + stack.count
+			capacity = capacity + stack.prototype.stack_size
+		else
+			capacity = capacity + fallback_stack
+		end
+	end
+	if capacity <= 0 then
+		return 1
+	end
+	return filled / capacity
+end
+
+-- True when every fuel-bearing carriage on the train meets the configured fill %.
+-- Carriages without a fuel inventory are ignored. Trains with no burners pass.
+local function train_meets_refuel_threshold(train)
+	if not settings.global["ick-require-refuel"].value then
+		return true
+	end
+	if not train or not train.valid then
+		return false
+	end
+	local threshold = (settings.global["ick-refuel-percent"].value or 100) / 100
+	for _, carriage in pairs(train.carriages) do
+		local ratio = carriage_fuel_fill_ratio(carriage)
+		if ratio ~= nil and ratio + 1e-9 < threshold then
+			return false
+		end
+	end
+	return true
+end
+
+local function find_train_near_job(job)
+	if not job or not job.centroid or not job.surface_index or not job.force_name then
+		return nil, nil
+	end
+	local surface = game.surfaces[job.surface_index]
+	if not surface then
+		return nil, nil
+	end
+	local candidates = surface.find_entities_filtered{
+		type = {"locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon"},
+		position = job.centroid,
+		radius = 20,
+		force = job.force_name,
+	}
+	for _, carriage in pairs(candidates) do
+		local train = carriage.train
+		if train and counts_match(job.expected, count_carriages(train)) then
+			return train, carriage
+		end
+	end
+	return nil, nil
+end
+
 local function try_complete_repair_job(job_id, entity)
 	local job = storage.ick_repair_jobs and storage.ick_repair_jobs[job_id]
 	if not job then
+		ick_dbg("complete: no job id=" .. tostring(job_id))
 		return
 	end
+	local train = entity and entity.valid and entity.train
+	local counts_ok = train and counts_match(job.expected, count_carriages(train))
+
+	-- If the live consist already matches, leftover "pending" ghost regs are stale
+	-- (rebuild matched poorly, or cars were destroyed again mid-repair). Do not block
+	-- schedule restore on them — that left trains with empty LuaTrain.schedule forever.
+	if counts_ok and not pending_is_empty(job.pending) then
+		local n = 0
+		for reg, _ in pairs(job.pending) do
+			n = n + 1
+			job.pending[reg] = nil
+			job.built[reg] = true
+			if storage.ick_destroyed_train then
+				storage.ick_destroyed_train[reg] = nil
+			end
+		end
+		ick_dbg(string.format(
+			"complete: consist MATCHES expected — cleared %d stale pending ghost(s) job=%s train=%s",
+			n,
+			tostring(job_id),
+			tostring(train.id)
+		))
+	end
+
 	if not pending_is_empty(job.pending) then
+		local n = 0
+		for _ in pairs(job.pending) do
+			n = n + 1
+		end
+		ick_dbg(string.format(
+			"complete: still pending ghosts job=%s count=%d counts_ok=%s",
+			tostring(job_id),
+			n,
+			tostring(counts_ok)
+		))
 		hold_entity_train(entity)
 		return
 	end
-	if entity and entity.valid and entity.train and counts_match(job.expected, count_carriages(entity.train)) then
+	if counts_ok then
+		-- Recover timetable onto the job before any apply (also while waiting for fuel).
+		if not record_has_schedule(job) then
+			ick_dbg("complete: job missing schedule — recovering from history/cache")
+			local hist = find_scheduled_history_record(entity)
+			if hist then
+				merge_identity_into(job, hist)
+			end
+			local cached = find_cached_identity(entity, job.expected)
+			if cached then
+				merge_identity_into(job, cached)
+			end
+			ick_dbg("complete: after recover " .. ick_dbg_schedule_summary(job.schedule))
+		end
+
+		if not train_meets_refuel_threshold(train) then
+			-- Consist is whole: put schedule/group back now so the GUI is not empty while
+			-- waiting for fuel. Only automatic mode from the *job* stays deferred until fuel.
+			local was_manual = train.manual_mode
+			local live_sched = snapshot_train_schedule(train, true)
+			local need_apply = job.schedule_applied_train_id ~= train.id
+				or schedule_score(live_sched) < schedule_score(job.schedule)
+			if need_apply and record_has_schedule(job) then
+				ick_dbg("complete: applying schedule while awaiting_refuel train=" .. tostring(train.id))
+				apply_train_identity(train, job.group, job.schedule)
+				train.manual_mode = was_manual
+				job.schedule_applied_train_id = train.id
+				register_train(train, {force_identity = true, remember = true})
+			end
+			if not job.awaiting_refuel then
+				ick_dbg("complete: awaiting_refuel job=" .. tostring(job_id) .. " " .. ick_dbg_schedule_summary(job.schedule))
+			end
+			job.awaiting_refuel = true
+			return
+		end
+		ick_dbg("complete: READY job=" .. tostring(job_id) .. " " .. ick_dbg_identity_summary("job", job))
+		-- Preserve player automatic if they already enabled it (e.g. after fueling by hand).
+		local player_had_auto = train.manual_mode == false
+		job.awaiting_refuel = nil
 		arm_schedule_restore(job)
-		local train = entity.train
 		apply_train_identity(train, job.group, job.schedule)
-		if job.was_automatic and settings.global["ick-automatic-mode"].value then
+		if player_had_auto or (job.was_automatic and settings.global["ick-automatic-mode"].value) then
 			train.manual_mode = false
 		else
 			hold_train(train)
 		end
+		-- Rebind new unit numbers to this train id and cache identity for the next kill cycle.
+		local live = register_train(train, {force_identity = true, remember = true})
+		if live then
+			remember_identity({
+				force_name = job.force_name or live.force_name,
+				surface_index = job.surface_index or live.surface_index,
+				centroid = live.centroid or job.centroid,
+				schedule = job.schedule or live.schedule,
+				group = job.group or live.group,
+				was_automatic = job.was_automatic or live.was_automatic,
+				expected = job.expected or live.expected,
+			})
+		else
+			remember_identity(job)
+		end
+		local verify = snapshot_train_schedule(train)
+		ick_dbg(string.format(
+			"complete: DONE job=%s train=%s verify_%s — if verify schedule=nil, apply failed or was wiped",
+			tostring(job_id),
+			tostring(train.id),
+			ick_dbg_schedule_summary(verify)
+		))
 		storage.ick_repair_jobs[job_id] = nil
 	else
+		ick_dbg(string.format(
+			"complete: counts mismatch or no train job=%s train=%s",
+			tostring(job_id),
+			train and tostring(train.id) or "nil"
+		))
 		-- Keep the job (and schedule) until counts match or ghosts are cancelled.
 		hold_entity_train(entity)
+	end
+end
+
+-- Re-check jobs for a live train (player fuel insert, fast transfer, etc.).
+local function try_complete_jobs_for_train(train)
+	if not train or not train.valid or not storage.ick_repair_jobs then
+		return
+	end
+	local actual = count_carriages(train)
+	local first = train.carriages[1]
+	if not first then
+		return
+	end
+	for job_id, job in pairs(storage.ick_repair_jobs) do
+		if counts_match(job.expected, actual) then
+			try_complete_repair_job(job_id, first)
+		end
 	end
 end
 
@@ -585,28 +1510,24 @@ local function attach_death_to_job(entity, train, registration_number, record, t
 	local job_id = find_job_for_record(train_id, entity)
 	if not job_id then
 		if not allow_create or not record then
+			ick_dbg(string.format(
+				"attach_death: NO job created allow=%s has_record=%s has_sched=%s",
+				tostring(allow_create),
+				tostring(record ~= nil),
+				tostring(record and record_has_schedule(record))
+			))
 			return nil
 		end
 		job_id = create_repair_job_from_record(record, entity)
+		ick_dbg("attach_death: created job_id=" .. tostring(job_id))
 	else
 		local job = storage.ick_repair_jobs[job_id]
 		job.member_unit_numbers[entity.unit_number] = true
+		ick_dbg("attach_death: joining job_id=" .. tostring(job_id) .. " before merge " .. ick_dbg_schedule_summary(job.schedule))
 		if record then
-			if not job.schedule and record.schedule then
-				job.schedule = deep_copy(record.schedule)
-			end
-			if (not job.group or job.group == "") and record.group then
-				job.group = record.group
-			end
-			if record.was_automatic then
-				job.was_automatic = true
-			end
-			if record.carriages and (not job.carriages or #job.carriages < #record.carriages) then
-				job.carriages = deep_copy(record.carriages)
-				job.expected = deep_copy(record.expected)
-				job.centroid = deep_copy(record.centroid)
-			end
+			merge_identity_into(job, record)
 		end
+		ick_dbg("attach_death: after merge " .. ick_dbg_schedule_summary(job.schedule))
 	end
 	storage.ick_repair_jobs[job_id].pending[registration_number] = true
 	storage.ick_destroyed_train[registration_number].job_id = job_id
@@ -644,11 +1565,25 @@ end)
 
 script.on_configuration_changed(function()
 	ensure_storage()
+	-- ick-fuel-amount used to be an absolute count (0 = full inventory). It is now 0–100%.
+	if not storage.ick_migrated_fuel_amount_percent then
+		local current = settings.global["ick-fuel-amount"].value
+		if current == 0 or current > 100 then
+			settings.global["ick-fuel-amount"] = {value = 100}
+		end
+		storage.ick_migrated_fuel_amount_percent = true
+	end
 	refresh_all_trains()
 end)
 
 script.on_event(defines.events.on_train_created, function(event)
 	ensure_storage()
+	ick_dbg(string.format(
+		"EVENT on_train_created new=%s old1=%s old2=%s",
+		event.train and tostring(event.train.id) or "nil",
+		tostring(event.old_train_id_1),
+		tostring(event.old_train_id_2)
+	))
 	-- Freeze old ids instead of deleting — full-wipe repair still needs that snapshot.
 	if event.old_train_id_1 then
 		freeze_train_id(event.old_train_id_1)
@@ -657,30 +1592,63 @@ script.on_event(defines.events.on_train_created, function(event)
 		freeze_train_id(event.old_train_id_2)
 	end
 	register_train(event.train)
+	inherit_identity_onto_train_record(event.train, event.old_train_id_1, event.old_train_id_2)
 	try_apply_awaiting_restore(event.train)
 	if storage.ick_repair_jobs and event.train then
-		for _, job in pairs(storage.ick_repair_jobs) do
-			if not pending_is_empty(job.pending) then
+		for job_id, job in pairs(storage.ick_repair_jobs) do
+			if event.train.carriages[1] then
+				try_complete_repair_job(job_id, event.train.carriages[1])
+			end
+			if not pending_is_empty(job.pending) and storage.ick_repair_jobs[job_id] then
 				hold_train(event.train)
-				break
 			end
 		end
 	end
 end)
 
 script.on_event(defines.events.on_train_schedule_changed, function(event)
-	register_train(event.train)
+	local train = event.train
+	if not train or not train.valid then
+		return
+	end
+	local live_schedule = snapshot_train_schedule(train)
+	local near_repair = train_near_repair_context(train)
+	ick_dbg(string.format(
+		"EVENT on_train_schedule_changed train=%s near_repair=%s live_score=%d %s",
+		tostring(train.id),
+		tostring(near_repair),
+		schedule_score(live_schedule),
+		ick_dbg_schedule_summary(live_schedule)
+	))
+	if schedule_score(live_schedule) > 0 then
+		-- Real timetable present — accept and cache.
+		register_train(train, {force_identity = true, remember = true})
+		return
+	end
+	-- Empty schedule events fire on splits/rebuilds and were wiping inherited identity + cache.
+	-- While a repair is in progress nearby, preserve history. Otherwise allow a true clear.
+	if near_repair then
+		ick_dbg("schedule_changed: empty + near repair -> PRESERVE path")
+		register_train(train)
+		inherit_identity_onto_train_record(train, nil, nil)
+	else
+		ick_dbg("schedule_changed: empty + NOT near repair -> FORCE wipe path (may clear cache)")
+		register_train(train, {force_identity = true, remember = true})
+	end
 end)
 
 script.on_event(defines.events.on_train_changed_state, function(event)
-	-- Keep was_automatic / layout current while trains move and change state.
-	register_train(event.train)
+	-- Keep layout current; quiet to avoid console spam while trains move.
+	register_train(event.train, {quiet = true})
 end)
 
 script.on_nth_tick(300, function()
 	-- Low-frequency refresh so idle trains stay accurate without per-tick cost.
 	if game and game.forces then
-		refresh_all_trains()
+		for _, train in pairs(game.train_manager.get_trains{}) do
+			register_train(train, {quiet = true})
+		end
+		cleanup_expired_train_records()
 	end
 end)
 
@@ -697,20 +1665,43 @@ script.on_event(defines.events.on_entity_died, function(event)
 
 	ensure_storage()
 	local train = entity.train
-	-- Prefer the registry snapshot from BEFORE this death (survives Factorio wiping LuaTrain).
+	ick_dbg(string.format(
+		"==== DEATH %s unit=%s train=%s ====",
+		tostring(entity.name),
+		tostring(entity.unit_number),
+		train and tostring(train.id) or "nil"
+	))
+
+	-- Prefer historical records that still have a schedule; disregard blank snapshots.
 	local record, train_id = lookup_train_record(entity, nil)
+	ick_dbg("death after lookup " .. ick_dbg_identity_summary("record", record) .. " id=" .. tostring(train_id))
+
+	local hist, hist_id = find_scheduled_history_record(entity)
+	if hist and (not record or not record_has_schedule(record) or record_preference_score(hist) > record_preference_score(record)) then
+		ick_dbg("death: preferring scheduled history id=" .. tostring(hist_id))
+		if record then
+			merge_identity_into(hist, record)
+		end
+		record = hist
+		train_id = hist_id or train_id
+	elseif hist then
+		ick_dbg("death: history exists but not preferred over lookup")
+	else
+		ick_dbg("death: no scheduled history")
+	end
+
 	if train and train.valid then
-		-- Also capture a fresh snapshot if the train is still fully readable.
 		local live = register_train(train)
-		-- Prefer the larger/richer record for expected composition (pre-split).
 		if record and live then
-			local record_n = record.carriages and #record.carriages or 0
-			local live_n = live.carriages and #live.carriages or 0
-			if live_n >= record_n and (live.schedule or live.group) then
+			-- Never let a blank live fragment replace a scheduled history record.
+			if record_has_schedule(record) and not record_has_schedule(live) then
+				merge_identity_into(record, live)
+			elseif record_has_schedule(live) and schedule_score(live.schedule) > schedule_score(record.schedule) then
+				merge_identity_into(live, record)
 				record = live
 				train_id = live.train_id
-			elseif not record.schedule and live.schedule then
-				record.schedule = deep_copy(live.schedule)
+			else
+				merge_identity_into(record, live)
 			end
 		elseif live and not record then
 			record = live
@@ -718,11 +1709,72 @@ script.on_event(defines.events.on_entity_died, function(event)
 		end
 	end
 
+	local cached = find_cached_identity(entity, record and record.expected or nil)
+	if cached and record_has_schedule(cached) then
+		if not record then
+			record = {
+				train_id = train_id,
+				schedule = deep_copy(cached.schedule),
+				group = cached.group,
+				was_automatic = cached.was_automatic,
+				expected = deep_copy(cached.expected),
+				centroid = deep_copy(cached.centroid),
+				force_name = cached.force_name,
+				surface_index = cached.surface_index,
+				carriages = nil,
+			}
+		else
+			merge_identity_into(record, cached)
+		end
+	elseif cached and record then
+		merge_identity_into(record, cached)
+	end
+
+	-- Open repair jobs often still hold the pre-damage schedule across rebuilds.
+	local existing_job_id = find_job_for_record(train_id, entity)
+	if existing_job_id and storage.ick_repair_jobs[existing_job_id] then
+		local job = storage.ick_repair_jobs[existing_job_id]
+		if not record then
+			record = {
+				train_id = job.source_train_id or train_id,
+				schedule = deep_copy(job.schedule),
+				group = job.group,
+				was_automatic = job.was_automatic,
+				expected = deep_copy(job.expected),
+				centroid = deep_copy(job.centroid),
+				force_name = job.force_name,
+				surface_index = job.surface_index,
+				carriages = deep_copy(job.carriages),
+			}
+			train_id = job.source_train_id or train_id
+		else
+			merge_identity_into(record, job)
+		end
+	end
+
+	-- Final pass: if we still lack a schedule, search history/jobs one more time.
+	if record and not record_has_schedule(record) then
+		ick_dbg("death: FINAL PASS still no schedule on record — searching history again")
+		local again = find_scheduled_history_record(entity)
+		if again then
+			merge_identity_into(record, again)
+		end
+	end
+
+	ick_dbg("death FINAL identity for job " .. ick_dbg_identity_summary("record", record))
+
 	local killed_by_train = event.cause and event.cause.train ~= nil
 	local had_identity = record and (record.schedule or record.group or record.was_automatic)
 	local wants_repair_job = (not killed_by_train) and (had_identity or (train and train.manual_mode == false))
-	local existing_job_id = find_job_for_record(train_id, entity)
 	local join_existing_job = existing_job_id ~= nil
+	ick_dbg(string.format(
+		"death flags killed_by_train=%s had_identity=%s wants_job=%s join=%s existing_job=%s",
+		tostring(killed_by_train),
+		tostring(had_identity),
+		tostring(wants_repair_job),
+		tostring(join_existing_job),
+		tostring(existing_job_id)
+	))
 
 	local surface = entity.surface
 	if train and train.valid then
@@ -954,13 +2006,17 @@ local function built_entity(entity)
 				end
 			end
 
-			hold_entity_train(entity)
-
 			if stored_info.job_id and storage.ick_repair_jobs[stored_info.job_id] then
 				local job = storage.ick_repair_jobs[stored_info.job_id]
 				job.pending[registration_number] = nil
 				job.built[registration_number] = true
+				-- Only keep forcing manual while cars are still missing; awaiting-refuel must not.
+				if not pending_is_empty(job.pending) then
+					hold_entity_train(entity)
+				end
 				try_complete_repair_job(stored_info.job_id, entity)
+			else
+				hold_entity_train(entity)
 			end
 		end
 	end
@@ -976,28 +2032,58 @@ end, {{filter = "rolling-stock"}})
 
 script.on_event(defines.events.on_tick, function(event)
 	local waiting = storage.ick_awaiting_restore
-	if not waiting or not next(waiting) then
-		return
-	end
-	for token, entry in pairs(waiting) do
-		if event.tick > entry.expire_tick then
-			waiting[token] = nil
-		elseif entry.centroid and entry.surface_index and entry.force_name then
-			local surface = game.surfaces[entry.surface_index]
-			if surface then
-				local candidates = surface.find_entities_filtered{
-					type = {"locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon"},
-					position = entry.centroid,
-					radius = 20,
-					force = entry.force_name,
-				}
-				for _, carriage in pairs(candidates) do
-					if carriage.train and try_apply_awaiting_restore(carriage.train) then
-						break
+	if waiting and next(waiting) then
+		for token, entry in pairs(waiting) do
+			if event.tick > entry.expire_tick then
+				waiting[token] = nil
+			elseif entry.centroid and entry.surface_index and entry.force_name then
+				local surface = game.surfaces[entry.surface_index]
+				if surface then
+					local candidates = surface.find_entities_filtered{
+						type = {"locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon"},
+						position = entry.centroid,
+						radius = 20,
+						force = entry.force_name,
+					}
+					for _, carriage in pairs(candidates) do
+						if carriage.train and try_apply_awaiting_restore(carriage.train) then
+							break
+						end
 					end
 				end
 			end
 		end
+	end
+
+	-- Re-check repair jobs (including ones with stale pending ghosts).
+	local jobs = storage.ick_repair_jobs
+	if not jobs or not next(jobs) then
+		return
+	end
+	local has_awaiting = false
+	for _, job in pairs(jobs) do
+		if job.awaiting_refuel or not pending_is_empty(job.pending) then
+			has_awaiting = true
+			break
+		end
+	end
+	local interval = has_awaiting and 5 or 30
+	if event.tick % interval ~= 0 then
+		return
+	end
+	for job_id, job in pairs(jobs) do
+		local _, carriage = find_train_near_job(job)
+		if carriage then
+			try_complete_repair_job(job_id, carriage)
+		end
+	end
+end)
+
+-- Player shift-transfers fuel (or other items) into rolling stock.
+script.on_event(defines.events.on_player_fast_transferred, function(event)
+	local entity = event.entity
+	if entity and entity.valid and entity.train then
+		try_complete_jobs_for_train(entity.train)
 	end
 end)
 

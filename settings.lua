@@ -43,6 +43,23 @@ data:extend(
     name = "ick-fuel-amount",
 	order = "f[fuel-amount]",
 	minimum_value = 0,
-    default_value = 0
+	maximum_value = 100,
+    default_value = 100
+  },
+  {
+    setting_type = "runtime-global",
+    type = "bool-setting",
+    name = "ick-require-refuel",
+	order = "g[require-refuel]",
+    default_value = true
+  },
+  {
+    setting_type = "runtime-global",
+    type = "int-setting",
+    name = "ick-refuel-percent",
+	order = "h[refuel-percent]",
+	minimum_value = 0,
+	maximum_value = 100,
+    default_value = 100
   }
 })

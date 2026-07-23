@@ -1,4 +1,82 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.0.17
+Date: 2026-07-22
+  Bugfixes:
+    - Restore schedule/group as soon as the consist matches expected layout; only automatic mode waits for the refuel threshold (empty train GUI while awaiting fuel looked like a lost schedule).
+    - Prefer joining a nearby open repair job and never shrink expected carriage counts, so mid-rebuild kills no longer spawn a second undersized job that never completes correctly.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.16
+Date: 2026-07-22
+  Bugfixes:
+    - Fixed crash on load: use helpers.write_file for debug log (game.write_file was removed in Factorio 2.0).
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.15
+Date: 2026-07-22
+  Bugfixes:
+    - If the rebuilt consist already matches the expected layout, clear stale pending ghost regs and restore schedule — pending ghosts were blocking apply_train_identity forever after repeated destroys.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.14
+Date: 2026-07-22
+  Changes:
+    - Also write [ick-atr] debug lines to script-output/ick-atr-debug.log for easier sharing.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.13
+Date: 2026-07-22
+  Changes:
+    - Temporary verbose [ick-atr] schedule-debug logging to in-game console and factorio-current.log (toggle ICK_DEBUG in control.lua).
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.12
+Date: 2026-07-22
+  Bugfixes:
+    - Prefer historical train records that still have a schedule; disregard blank snapshots when looking up identity after repeated destroys.
+    - Empty on_train_schedule_changed during an active nearby repair no longer force-wipes inherited schedule or the identity cache (that was clearing timetables on split/rebuild).
+    - Cache/job merge never replaces a scheduled entry with a weaker blank one; job complete recovers schedule from history if the job lost it.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.11
+Date: 2026-07-22
+  Changes:
+    - Documentation and packaging sync: README rewritten for current behavior; info.json version/description aligned for portal release.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.10
+Date: 2026-07-22
+  Bugfixes:
+    - Preserve schedule/group across repeated destroys and rebuilds: empty live snapshots no longer erase richer identity; open jobs and a nearby identity cache refill blanks; new unit numbers are rebound on job complete.
+  Changes:
+    - on_train_schedule_changed still accepts a cleared schedule (and clears the nearby cache) so intentional player edits are not resurrected.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.9
+Date: 2026-07-22
+  Changes:
+    - If the player fuels a repaired train to the threshold themselves, the repair job completes and can resume automatic without fighting their controls.
+    - While awaiting refuel, re-check more often; also react to player fast-transfer into rolling stock.
+    - Completing a job preserves automatic mode if the player already enabled it.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.8
+Date: 2026-07-22
+  Changes:
+    - Fuel request amount setting is now a percent of fuel inventory capacity (0–100, default 100); old 0 (= full) migrates to 100.
+  Bugfixes:
+    - While waiting only for the refuel threshold, do not force the train back to manual — player automatic/manual changes are respected.
+
+---------------------------------------------------------------------------------------------------
+Version: 2.0.7
+Date: 2026-07-22
+  Features:
+    - Repair jobs can wait until the train is refueled before restoring schedule/automatic mode.
+    - New map settings: "Require refueling before repair job completes" (default true) and "Minimum fuel fill percent" (default 100).
+  Changes:
+    - While waiting for fuel, jobs are re-checked periodically so bot/logistic delivery can finish the job.
+
+---------------------------------------------------------------------------------------------------
 Version: 2.0.6
 Date: 2026-07-22
   Bugfixes:

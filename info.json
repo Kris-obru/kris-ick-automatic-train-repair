@@ -1,11 +1,11 @@
-{
-    "name": "kris-ick-automatic-train-repair",
-    "version": "2.0.6",
-    "title": "Automatic train repair",
-    "author": "Kristian432 and ickputzdirwech",
-    "contact": "kristian432obrusanszki@gmail.com",
-    "homepage": "https://github.com/Kris-obru/kris-ick-automatic-train-repair",
-    "factorio_version": "2.0",
-    "dependencies":["base >= 2.0.0"],
-    "description": "If any locomotive or wagon is destroyed the train is stopped and a ghost is created. Including inventory filters, inventory limit and requests for fuel and equipment. As soon as the train is fully repaired it is set to automatic mode again."
-}
+{
+    "name": "kris-ick-automatic-train-repair",
+    "version": "2.0.17",
+    "title": "Automatic train repair",
+    "author": "Kristian432 and ickputzdirwech",
+    "contact": "kristian432obrusanszki@gmail.com",
+    "homepage": "https://github.com/Kris-obru/kris-ick-automatic-train-repair",
+    "factorio_version": "2.0",
+    "dependencies": ["base >= 2.0.0"],
+    "description": "Stops a damaged train, places repair ghosts (fuel, equipment, filters), restores schedule/group when the consist is rebuilt, and restores automatic mode when the job finishes — optionally after refueling. Factorio 2.0 fork of ickputzdirwech's Automatic train repair."
+}

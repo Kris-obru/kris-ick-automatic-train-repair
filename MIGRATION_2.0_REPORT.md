@@ -1,10 +1,12 @@
 # Migration / debug report: Factorio 2.0 port
 
-**Mod:** `ick-automatic-train-repair`  
+> **Historical document** for the 1.1.4 → 2.0.0 port. Current shipping version is **2.0.17** (`kris-ick-automatic-train-repair`). Prefer `README.md`, `changelog.txt`, and `info.json` for present-day behavior.
+
+**Mod (at port time):** `ick-automatic-train-repair`  
 **From:** `1.1.4` (`factorio_version` 1.1)  
 **To:** `2.0.0` (`factorio_version` 2.0, `dependencies`: `base >= 2.0.0`)  
 **Target runtime:** Factorio **2.0.77** (and other 2.0 builds compatible with the declared dependency)  
-**Scope of this document:** Accurate notes from the current workspace code (`control.lua`, `info.json`, `changelog.txt`, `settings.lua`, `data.lua`, `README.md`) compared to tag/commit **1.1.4**. For future debugging by someone who owns this repo but is new to Factorio modding.
+**Scope of this document:** Accurate notes from the workspace code at port time (`control.lua`, `info.json`, `changelog.txt`, `settings.lua`, `data.lua`, `README.md`) compared to tag/commit **1.1.4**. For future debugging by someone who owns this repo but is new to Factorio modding.
 
 ---
 
